@@ -1,5 +1,6 @@
 import { createApi } from '@reduxjs/toolkit/query/react';
 import type { BaseQueryFn } from '@reduxjs/toolkit/query';
+import { AIRCRAFT, mergeCard, type OfflineCard, type ReceptionOutcome, type StageSignature, type TransferBatch } from './transfer';
 
 export type WorkCard = {
   id: string;
@@ -67,8 +68,47 @@ export const maintenanceApi = createApi({
         return { data: { accepted: true, revision: packageData.serverRevision + 1 } };
       },
       invalidatesTags: ['Package']
+    }),
+    receiveBatch: builder.mutation<
+      { outcome: ReceptionOutcome; commit: true },
+      { batch: TransferBatch; cards: OfflineCard[]; signatures: StageSignature[]; processedBatchNos: string[] }
+    >({
+      queryFn: async ({ batch, cards, signatures, processedBatchNos }) => {
+        await new Promise((resolve) => setTimeout(resolve, 620));
+        const legacy = !batch.sourceHangar;
+
+        // 批次号幂等：同一批次号只成一次，重复提交直接忽略。
+        if (processedBatchNos.includes(batch.batchNo)) {
+          return { data: { outcome: { batchNo: batch.batchNo, legacy, duplicate: true, changes: [], conflicts: [], rejected: [], signatureMerges: [], evidenceAdded: 0, statusAdvanced: 0 }, commit: true } };
+        }
+
+        const toProcess = batch.cards.filter((card) => !batch.mergedCardIds.includes(card.id));
+        const changes: ReceptionOutcome['changes'] = [];
+        const conflicts: ReceptionOutcome['conflicts'] = [];
+        const rejected: ReceptionOutcome['rejected'] = [];
+        const signatureMerges: ReceptionOutcome['signatureMerges'] = [];
+        let evidenceAdded = 0;
+        let statusAdvanced = 0;
+
+        for (let index = 0; index < toProcess.length; index += 1) {
+          // 模拟外站写入：首批次第三次写入瞬时失败，回到接站前，可重试补入剩余工卡。
+          if (batch.transientFailure && batch.attempts === 0 && index === 2) {
+            const partial: ReceptionOutcome = { batchNo: batch.batchNo, legacy, duplicate: false, changes, conflicts, rejected, signatureMerges, evidenceAdded, statusAdvanced };
+            return { error: { status: 500, data: { message: '写入超时：批次部分写入失败，已回到接站前；重试只补尚未并入的工卡。', partial } } };
+          }
+          const outcome = mergeCard(cards, signatures, toProcess[index], AIRCRAFT, legacy);
+          if (outcome.change) changes.push(outcome.change);
+          if (outcome.conflict) conflicts.push(outcome.conflict);
+          if (outcome.rejected) rejected.push({ cardId: toProcess[index].id, reason: outcome.rejected });
+          if (outcome.signatureMerge) signatureMerges.push(outcome.signatureMerge);
+          evidenceAdded += outcome.evidenceAdded;
+          statusAdvanced += outcome.statusAdvanced ? 1 : 0;
+        }
+
+        return { data: { outcome: { batchNo: batch.batchNo, legacy, duplicate: false, changes, conflicts, rejected, signatureMerges, evidenceAdded, statusAdvanced }, commit: true } };
+      }
     })
   })
 });
 
-export const { useGetWorkPackageQuery, useSubmitCardMutation } = maintenanceApi;
+export const { useGetWorkPackageQuery, useSubmitCardMutation, useReceiveBatchMutation } = maintenanceApi;

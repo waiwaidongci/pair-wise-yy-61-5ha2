@@ -43,8 +43,9 @@ import {
   PeopleRegular,
   WarningRegular
 } from '@fluentui/react-icons';
-import { useGetWorkPackageQuery, useSubmitCardMutation } from './api';
-import { authorizeOverride, refreshVersion, releasePackage, selectCard, setConflict, signStage, toggleOffline, updateCard, type RootState } from './store';
+import { useGetWorkPackageQuery, useSubmitCardMutation, useReceiveBatchMutation } from './api';
+import { authorizeOverride, refreshVersion, releasePackage, selectCard, setConflict, signStage, supplementConflict, toggleOffline, updateCard, applyReception, type RootState } from './store';
+import type { ReceptionOutcome, TransferBatch } from './transfer';
 
 type NavItem = { path: string; label: string; icon: ReactNode };
 
@@ -54,9 +55,11 @@ function Shell({ children }: { children: ReactNode }) {
   const nav: NavItem[] = [
     { path: '/', label: '工作包总览', icon: <ClipboardTaskListLtrRegular /> },
     { path: '/execution', label: '工卡执行', icon: <BookOpenRegular /> },
+    { path: '/transfer', label: '转站接收', icon: <ArrowSyncRegular /> },
     { path: '/release', label: '放行审阅', icon: <LockClosedRegular /> },
     { path: '/audit', label: '审计与差异', icon: <HistoryRegular /> }
   ];
+  const pendingTransfers = state.transferBatches.filter((batch) => batch.status === '待接收' || batch.status === '写入失败').length;
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -77,7 +80,7 @@ function Shell({ children }: { children: ReactNode }) {
             <span>工作包</span><strong>WP-B7891-04</strong><small>上海浦东 · H3 机库</small>
             <div><ProgressBar value={0.58} /><span>58% 工卡完成</span></div>
           </div>
-          <nav>{nav.map((item) => <NavLink end={item.path === '/'} key={item.path} to={item.path}>{item.icon}<span>{item.label}</span></NavLink>)}</nav>
+          <nav>{nav.map((item) => <NavLink end={item.path === '/'} key={item.path} to={item.path}>{item.icon}<span>{item.label}</span>{item.path === '/transfer' && pendingTransfers > 0 && <Badge appearance="filled" color="danger" size="small">{pendingTransfers}</Badge>}</NavLink>)}</nav>
           <div className="side-status"><WarningRegular /><div><strong>{state.cards.filter((card) => card.status === '待授权').length} 项待授权</strong><span>放行前必须处理</span></div></div>
         </aside>
         <main>{children}</main>
@@ -221,8 +224,8 @@ function Release() {
           </div>
         </section>
         <aside className="release-side">
-          <section className="panel signoff-card"><div className="panel-head"><h2>分阶段签字</h2><span>{state.signatures.filter((item) => item.status === '已签署').length} / 4</span></div>{state.signatures.map((item) => <div className="signoff-row" key={item.stage}><div><span>{item.stage}</span><strong>{item.actor}</strong><small>{item.time}</small></div>{item.status === '已签署' ? <Badge appearance="tint" color="success">已签署</Badge> : <Button size="small" appearance="primary" onClick={() => dispatch(signStage(item.stage))}>签署</Button>}</div>)}</section>
-          <section className="panel release-gate-card"><LockClosedRegular /><h3>放行门禁</h3><label><Checkbox checked={!blockers.some((card) => card.status === '待授权')} readOnly /> 无待授权超差项目</label><label><Checkbox checked={state.cards.filter((card) => card.status === '已完成').length >= 6} readOnly /> 关键工卡完成率 ≥ 75%</label><label><Checkbox checked={allSigned} readOnly /> 四个阶段均完成电子签署</label><label><Checkbox checked /> 审计记录和证据附件完整</label></section>
+          <section className="panel signoff-card"><div className="panel-head"><h2>分阶段签字</h2><span>{state.signatures.filter((item) => item.status === '已签署').length} / {state.signatures.length}</span></div>{state.signatures.map((item) => <div className="signoff-row" key={item.stage}><div><span>{item.stage}</span><strong>{item.actor}</strong><small>{item.time}</small></div>{item.status === '已签署' ? <Badge appearance="tint" color="success">已签署</Badge> : <Button size="small" appearance="primary" onClick={() => dispatch(signStage(item.stage))}>签署</Button>}</div>)}</section>
+          <section className="panel release-gate-card"><LockClosedRegular /><h3>放行门禁</h3><label><Checkbox checked={!blockers.some((card) => card.status === '待授权')} readOnly /> 无待授权超差项目</label><label><Checkbox checked={state.cards.filter((card) => card.status === '已完成').length >= 6} readOnly /> 关键工卡完成率 ≥ 75%</label><label><Checkbox checked={allSigned} readOnly /> 所有阶段均完成电子签署</label><label><Checkbox checked /> 审计记录和证据附件完整</label></section>
         </aside>
       </div>
     </div>
@@ -257,6 +260,143 @@ function Audit() {
   );
 }
 
+function TransferReception() {
+  const state = useSelector((root: RootState) => root.maintenance);
+  const dispatch = useDispatch();
+  const [receiveBatch, { isLoading }] = useReceiveBatchMutation();
+  const [lastResult, setLastResult] = useState<{ batchNo: string; merged: number; conflicts: number; rejected: number; evidenceAdded: number; signatureMerges: number; failed: boolean; message: string } | null>(null);
+  const [supplementFor, setSupplementFor] = useState<string | null>(null);
+  const [suppMeasurement, setSuppMeasurement] = useState('');
+  const [suppEvidence, setSuppEvidence] = useState('');
+
+  const pendingConflicts = state.conflicts.filter((item) => item.status === '挂起');
+  const resolvedConflicts = state.conflicts.filter((item) => item.status === '已补交');
+  const invalidatedStages = state.signatures.filter((item) => item.status === '待签署').length;
+
+  const handleReceive = async (batch: TransferBatch) => {
+    const result = await receiveBatch({ batch, cards: state.cards, signatures: state.signatures, processedBatchNos: state.processedBatchNos });
+    if ('data' in result && result.data) {
+      const outcome = result.data.outcome;
+      dispatch(applyReception({ outcome, commit: true }));
+      setLastResult({ batchNo: outcome.batchNo, merged: outcome.changes.length, conflicts: outcome.conflicts.length, rejected: outcome.rejected.length, evidenceAdded: outcome.evidenceAdded, signatureMerges: outcome.signatureMerges.length, failed: false, message: '' });
+    } else if ('error' in result && result.error) {
+      const error = result.error as { data?: { message?: string; partial?: ReceptionOutcome } };
+      if (error.data?.partial) dispatch(applyReception({ outcome: error.data.partial, commit: false }));
+      setLastResult({ batchNo: batch.batchNo, merged: error.data?.partial?.changes.length ?? 0, conflicts: 0, rejected: 0, evidenceAdded: 0, signatureMerges: 0, failed: true, message: error.data?.message ?? '写入失败，请重试。' });
+    }
+  };
+
+  const openSupplement = (cardId: string) => {
+    const conflict = state.conflicts.find((item) => item.cardId === cardId);
+    setSupplementFor(cardId);
+    setSuppMeasurement(conflict?.incomingValue ?? '');
+    setSuppEvidence('');
+  };
+
+  const submitSupplement = () => {
+    if (!supplementFor) return;
+    const evidenceFiles = suppEvidence.split(/[,，、]/).map((item) => item.trim()).filter(Boolean);
+    dispatch(supplementConflict({ cardId: supplementFor, measurement: suppMeasurement.trim(), evidenceFiles }));
+    setSupplementFor(null);
+  };
+
+  return (
+    <div className="page">
+      <PageHeading eyebrow="TRANSFER RECEPTION / MERGE BATCH" title="转站接收" description="按批次号认领外站工卡，无冲突数据并入当前包，冲突挂起并保留两份原值。" />
+      <MessageBar intent="info" className="top-message"><MessageBarBody><strong>合并规则：</strong>按工卡编号 + 飞机登记号认领；测量、证据、阶段签署无冲突并入当前包；两套记录不一致则挂起并保留两份原值；补交测量或证据后，相关签字与放行结论立即失效并重算；同一批次号只成一次；写入失败回到接站前，重试只补尚未并入的工卡。</MessageBarBody></MessageBar>
+
+      {lastResult && !lastResult.failed && (
+        <MessageBar intent="success" className="top-message"><MessageBarBody><strong>批次 {lastResult.batchNo} 接收完成：</strong>并入 {lastResult.merged} 项工卡、证据 {lastResult.evidenceAdded} 份、阶段签署 {lastResult.signatureMerges} 项；挂起 {lastResult.conflicts} 项（保留两份原值）；认领失败 {lastResult.rejected} 项。完成数与放行单按合并后的当前包重算，不重复计数。</MessageBarBody></MessageBar>
+      )}
+      {lastResult?.failed && (
+        <MessageBar intent="warning" className="top-message"><MessageBarBody><strong>批次 {lastResult.batchNo} 写入失败：</strong>{lastResult.message}本次已并入 {lastResult.merged} 项，其余工卡未并入；点击「重试接收」只补尚未并入的工卡。</MessageBarBody></MessageBar>
+      )}
+      {!state.released && state.cards.some((card) => card.measurement || card.evidenceFiles?.length) && (
+        <MessageBar intent="warning" className="top-message"><MessageBarBody><strong>放行结论待重算：</strong>转站数据并入或补交后，{invalidatedStages} 个阶段签字处于待签署状态，工作包需重新签署并锁定放行。</MessageBarBody></MessageBar>
+      )}
+
+      <section className="panel batch-panel">
+        <div className="panel-head"><div><h2>转入批次</h2><span>同一批次号重复提交只成一次</span></div><Badge appearance="tint">{state.transferBatches.length} 批</Badge></div>
+        {state.transferBatches.map((batch) => {
+          const processed = batch.mergedCardIds.length;
+          const total = batch.cards.length;
+          const statusColor = batch.status === '已接收' ? 'success' : batch.status === '写入失败' ? 'danger' : 'informative';
+          const statusLabel = batch.status === '已接收' ? '已接收' : batch.status === '写入失败' ? '写入失败 · 可重试' : '待接收';
+          return (
+            <div className="batch-row" key={batch.batchNo}>
+              <div className="batch-main">
+                <div className="batch-title"><strong>{batch.batchNo}</strong>{batch.sourceHangar ? <Badge appearance="tint" color="brand">{batch.sourceHangar}</Badge> : <Badge appearance="tint" color="success">本站历史 · 无来源标记</Badge>}<Badge appearance="outline">{batch.aircraft}</Badge></div>
+                <small>{batch.packageId} · 转入 {batch.receivedAt} · 共 {total} 项工卡 · 已并入 {processed} 项{batch.attempts > 0 ? ` · 第 ${batch.attempts} 次接收` : ''}</small>
+                <div className="batch-progress"><ProgressBar value={total ? processed / total : 0} /><span>{processed} / {total}</span></div>
+              </div>
+              <div className="batch-actions">
+                <Badge appearance="filled" color={statusColor}>{statusLabel}</Badge>
+                <Button appearance={batch.status === '写入失败' ? 'primary' : 'secondary'} size="small" disabled={isLoading || batch.status === '已接收'} onClick={() => handleReceive(batch)}>{batch.status === '写入失败' ? '重试接收' : '接收合并'}</Button>
+              </div>
+            </div>
+          );
+        })}
+      </section>
+
+      <div className="transfer-grid">
+        <section className="panel">
+          <div className="panel-head"><div><h2>挂起冲突</h2><span>两套记录不一致，保留两份原值</span></div><Badge appearance="tint" color="danger">{pendingConflicts.length}</Badge></div>
+          {pendingConflicts.length === 0 && <div className="empty-hint">无挂起冲突。两套记录一致的测量、证据与阶段签署已并入当前包。</div>}
+          {pendingConflicts.map((conflict) => {
+            const card = state.cards.find((item) => item.id === conflict.cardId);
+            return (
+              <div className="conflict-row" key={conflict.cardId}>
+                <div className="conflict-head"><strong>{conflict.cardId}</strong><span>{card?.title}</span></div>
+                <div className="conflict-values">
+                  <div className="conflict-value local"><span>本站原值</span><code>{conflict.localValue || '（空）'}</code></div>
+                  <div className="conflict-value incoming"><span>外站值</span><code>{conflict.incomingValue || '（空）'}</code></div>
+                </div>
+                <div className="conflict-foot"><small>阶段「{card?.stage}」签字与放行结论将在补交后失效重算</small><Button size="small" appearance="primary" onClick={() => openSupplement(conflict.cardId)}>补交并重算</Button></div>
+              </div>
+            );
+          })}
+        </section>
+
+        <aside className="transfer-side">
+          <section className="panel">
+            <div className="panel-head"><div><h2>已补交重算</h2><span>签字与放行已失效</span></div><Badge appearance="tint" color="success">{resolvedConflicts.length}</Badge></div>
+            {resolvedConflicts.length === 0 && <div className="empty-hint">补交测量或证据后，相关阶段签字立即失效并回到待签署，放行结论需重新锁定。</div>}
+            {resolvedConflicts.map((conflict) => (
+              <div className="resolved-row" key={conflict.cardId}><strong>{conflict.cardId}</strong><div><span>采用值</span><code>{conflict.resolvedValue}</code></div><small>阶段签字已失效 · 放行待重算</small></div>
+            ))}
+          </section>
+          <section className="panel">
+            <div className="panel-head"><div><h2>当前包合并状态</h2></div></div>
+            <dl className="merge-stats">
+              <div><dt>工卡完成</dt><dd>{state.cards.filter((card) => card.status === '已完成').length} / {state.cards.length}</dd></div>
+              <div><dt>证据附件</dt><dd>{state.cards.reduce((sum, card) => sum + (card.evidenceFiles?.length ?? 0), 0)} 份</dd></div>
+              <div><dt>待签署阶段</dt><dd>{state.signatures.filter((item) => item.status === '待签署').length} / {state.signatures.length}</dd></div>
+              <div><dt>放行基线</dt><dd>{state.released ? '已锁定' : '未锁定 · 待重算'}</dd></div>
+            </dl>
+          </section>
+        </aside>
+      </div>
+
+      <Dialog open={supplementFor !== null} onOpenChange={(_, data) => { if (!data.open) setSupplementFor(null); }}>
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>补交测量与证据 · {supplementFor}</DialogTitle>
+            <DialogContent>
+              <MessageBar intent="warning"><MessageBarBody>补交后，该工卡相关阶段签字立即失效（回到待签署），放行结论同步失效并按当前包重新计算。</MessageBarBody></MessageBar>
+              <Field label="补交测量值" required className="dialog-field"><Input value={suppMeasurement} onChange={(_, data) => setSuppMeasurement(data.value)} contentBefore={<GaugeRegular />} /></Field>
+              <Field label="补交证据附件" hint="多个文件以逗号分隔" className="dialog-field"><Input value={suppEvidence} onChange={(_, data) => setSuppEvidence(data.value)} placeholder="例如：压力复测报告.pdf, 见证签字单.jpg" /></Field>
+            </DialogContent>
+          </DialogBody>
+          <DialogActions>
+            <Button appearance="secondary" onClick={() => setSupplementFor(null)}>取消</Button>
+            <Button appearance="primary" onClick={submitSupplement} disabled={!suppMeasurement.trim()}>确认补交并重算</Button>
+          </DialogActions>
+        </DialogSurface>
+      </Dialog>
+    </div>
+  );
+}
+
 function NotFound() {
   return <Navigate to="/" replace />;
 }
@@ -265,7 +405,7 @@ export default function App() {
   return (
     <FluentProvider theme={webLightTheme}>
       <BrowserRouter>
-        <Shell><Routes><Route path="/" element={<Overview />} /><Route path="/execution" element={<Execution />} /><Route path="/release" element={<Release />} /><Route path="/audit" element={<Audit />} /><Route path="*" element={<NotFound />} /></Routes></Shell>
+        <Shell><Routes><Route path="/" element={<Overview />} /><Route path="/execution" element={<Execution />} /><Route path="/transfer" element={<TransferReception />} /><Route path="/release" element={<Release />} /><Route path="/audit" element={<Audit />} /><Route path="*" element={<NotFound />} /></Routes></Shell>
       </BrowserRouter>
     </FluentProvider>
   );
